@@ -16,6 +16,8 @@ from sklearn.metrics import roc_auc_score
 import progressbar as pb
 import argparse
 
+from attention_net import AttentionNet
+
 
 class MyDataSet(Dataset):
     '''
@@ -23,13 +25,13 @@ class MyDataSet(Dataset):
     args:
         text_file: ndarray, N x 2, N是样本数，
             第一列是每个人数据文件的名字，第二列是每个人的标签。
-        root_dir：所有数据文件所在的文件夹路径。
+        trainval_root：所有数据文件所在的文件夹路径。
     '''
 
-    def __init__(self, txt_file, root_dir):
+    def __init__(self, txt_file, trainval_root):
         super(MyDataSet, self).__init__()
         self.txt_file = txt_file
-        self.root_dir = root_dir
+        self.trainval_root = trainval_root
 
     def __len__(self):
         return len(self.txt_file)
@@ -38,7 +40,7 @@ class MyDataSet(Dataset):
         file_name = self.txt_file[idx, 0]
         label = self.txt_file[idx, 1]
         # 将路径和文件名merge在一起
-        file_path = os.path.join(self.root_dir, file_name + ".mat")
+        file_path = os.path.join(self.trainval_root, file_name + ".mat")
         file = io.loadmat(file_path)
         return file["data"], np.int(label)
 
@@ -75,8 +77,10 @@ class CnnNet(nn.Module):
         self.conv_k = conv_k
         self.conv_s = conv_s
         self.conv_p = conv_p
-        self.pool_k = [pool_k] * len(conv_k)
-        self.pool_s = [pool_s] * len(conv_s)
+        self.pool_k = [pool_k] * len(conv_k) \
+            if isinstance(pool_k, int) else pool_k
+        self.pool_s = [pool_s] * len(conv_s) \
+            if isinstance(pool_s, int) else pool_s
         self.pool_p = [0] * len(conv_p)
         self.bn = bn
         convs = []
@@ -128,6 +132,39 @@ class CnnNet(nn.Module):
     @staticmethod
     def _one_shape(i_s, k, p, s):
         return math.floor((i_s + 2 * p - (k - 1) - 1) / s + 1)
+
+
+def test(net, criterion, dataloader, device, evaluation=True):
+    ''' 根据训练好的net来进行预测，可以输出loss和评价指标 '''
+    print('Testing...')
+    with torch.no_grad():
+        predicts = []
+        y_true = []
+        running_loss = 0.
+        running_corrects = 0
+        for inputs, labels in dataloader:
+            inputs = inputs.to(device, dtype=torch.float)
+            labels = labels.to(device)
+            outputs = net(inputs)
+            _, preds = torch.max(outputs, 1)
+            if evaluation:
+                loss = criterion(outputs, labels)
+                running_loss += loss.item() * inputs.size(0)
+                running_corrects += torch.sum(preds == labels)
+            predicts.append(outputs)
+            if evaluation:
+                y_true.append(labels)
+        predicts = torch.cat(predicts, 0)
+        if evaluation:
+            y_true = torch.cat(y_true, 0)
+            epoch_loss = running_loss / len(dataloader.dataset)
+            epoch_acc = running_corrects.double() / len(dataloader.dataset)
+            epoch_auc = roc_auc_score(
+                y_true.cpu().numpy(), predicts.cpu().numpy()[:, 1])
+            test_results = [epoch_loss, epoch_acc.item(), epoch_auc]
+            return predicts, test_results
+        else:
+            return predicts
 
 
 def train(
@@ -218,31 +255,9 @@ def train(
     print('valid, best_acc: %.4f, best_auc: %.4f' % (best_acc, best_auc))
     # 如果有test数据集，则进行他test的预测
     if 'test' in dataloaders.keys():
-        print('Testing...')
-        with torch.no_grad():
-            predicts = []
-            y_true = []
-            running_loss = 0.
-            running_corrects = 0
-            for inputs, labels in dataloaders['test']:
-                inputs = inputs.to(device, dtype=torch.float)
-                labels = labels.to(device)
-                outputs = net(inputs)
-                _, preds = torch.max(outputs, 1)
-                loss = criterion(outputs, labels)
-                running_loss += loss.item() * inputs.size(0)
-                running_corrects += torch.sum(preds == labels)
-                predicts.append(outputs)
-                y_true.append(labels)
-            predicts = torch.cat(predicts, 0)
-            y_true = torch.cat(y_true, 0)
-            epoch_loss = running_loss / len(dataloaders['test'].dataset)
-            epoch_acc = running_corrects.double() / len(
-                dataloaders['test'].dataset)
-            epoch_auc = roc_auc_score(
-                y_true.cpu().numpy(), predicts.cpu().numpy()[:, 1])
-    test_results = [epoch_loss, epoch_acc.item(), epoch_auc]
-    print(test_results)
+        _, test_results = test(
+            net, criterion, dataloaders['test'], device, evaluation=True)
+        print(test_results)
 
     return test_results, history, best_model_wts
 
@@ -250,30 +265,72 @@ def train(
 def main():
     # 载入命令行参数，并进行解析
     parser = argparse.ArgumentParser()
+    parser.add_argument('save', default='exam', nargs='?',
+                        help='保存结果的文件夹的名称')
     parser.add_argument(
         '-cc', '--conv_c', default=[20, 40, 60, 80], type=int, nargs='+',
-        help=''
+        help='卷积核层输入的feature map的channels， 默认是[20, 40, 60, 80]'
     )
     parser.add_argument(
-        '-ck', '--conv_k', default=[10] * 4, type=int, nargs='+')
+        '-ck', '--conv_k', default=[10] * 4, type=int, nargs='+',
+        help=(
+            (
+                '使用的卷积的卷积核大小，如果是使用attention，则是'
+                'attention block使用的卷积核大小，默认是10'
+            )
+        )
+    )
     parser.add_argument(
-        '-cs', '--conv_s', default=[1] * 4, type=int, nargs='+')
+        '-cs', '--conv_s', default=[1] * 4, type=int, nargs='+',
+        help='使用的卷积操作的stride，默认是1'
+    )
     parser.add_argument(
-        '-cp', '--conv_p', default=[0] * 4, type=int, nargs='+')
+        '-cp', '--conv_p', default=[0] * 4, type=int, nargs='+',
+        help='使用的卷积操作的padding，默认是0'
+    )
     parser.add_argument(
-        '-lh', '--linear_hidden', default=[], type=int, nargs='+')
-    parser.add_argument('-pk', '--pool_k', default=20, type=int)
-    parser.add_argument('-ps', '--pool_s', default=5, type=int)
-    parser.add_argument('-pt', '--pool_type', default='max')
-    parser.add_argument('-rs', '--random_seed', default=1234, type=int)
+        '-lh', '--linear_hidden', default=[], type=int, nargs='+',
+        help='最后要接的fc的隐层的units，默认是空，即直接进行softmax'
+    )
+    parser.add_argument(
+        '-pk', '--pool_k', default=20, type=int, nargs='+',
+        help=(
+            '每个conv后跟的pooling的kernel的大小，默认是20'
+            '当使用attention时，其指代的是每个block后跟的那个pooling layer'
+        ))
+    parser.add_argument(
+        '-ps', '--pool_s', default=5, type=int, nargs='+',
+        help=(
+            'pooling的stride，默认是5'
+            '当使用attention时，其指代的是每个block后跟的那个pooling layer'
+        ))
+    parser.add_argument(
+        '-pt', '--pool_type', default='max',
+        help='pooling的种类，默认是max，还可以是avg')
+    parser.add_argument(
+        '-rs', '--random_seed', default=1234, type=int, help='随机种子')
     parser.add_argument(
         '-tvr', '--trainval_root', default='E:/subject-other/心电比赛/TRAIN',
-        help='训练集所在的路径')
-    parser.add_argument('-lr', '--learning_rate', default=.01, type=float)
-    parser.add_argument('-bs', '--batch_size', default=32, type=int)
-    parser.add_argument('-e', '--epoch', default=500, type=int)
-    parser.add_argument('-is', '--input_size', default=12, type=int)
-    parser.add_argument('-sd', '--save_dir', default='./results/exam')
+        help='训练集所在的路径，默认是E:/subject-other/心电比赛/TRAIN')
+    parser.add_argument(
+        '-lr', '--learning_rate', default=.01, type=float,
+        help='默认的初始学习率是0.01'
+    )
+    parser.add_argument(
+        '-bs', '--batch_size', default=32, type=int,
+        help='默认的batch size是32')
+    parser.add_argument(
+        '-e', '--epoch', default=500, type=int,
+        help='最大的epoch数量，默认是500')
+    parser.add_argument(
+        '-is', '--input_size', default=12, type=int,
+        help='输入的特征的大小，默认是12')
+    parser.add_argument(
+        '-sr', '--save_root', default='E:/subject-other/心电比赛/results',
+        help='保存结果的根目录，默认是E:/subject-other/心电比赛/results')
+    parser.add_argument(
+        '-m', '--mode', default='dense',
+        help='使用的网络类型，默认是dense，可以是attention')
     args = parser.parse_args()
     device = torch.device("cuda:0")
 
@@ -286,21 +343,29 @@ def main():
         valid_txt, test_size=0.5, shuffle=True,
         random_state=args.random_seed, stratify=valid_txt[:, 1])
     datasets = {
-        "train": MyDataSet(train_txt, args.root_dir),
-        "val": MyDataSet(valid_txt, args.root_dir),
-        "test": MyDataSet(test_txt, args.root_dir)
+        "train": MyDataSet(train_txt, args.trainval_root),
+        "val": MyDataSet(valid_txt, args.trainval_root),
+        "test": MyDataSet(test_txt, args.trainval_root)
     }
     dataloaders = {
         k: DataLoader(v, batch_size=args.batch_size)
         for k, v in datasets.items()}
 
     # 构建网络
-    net = CnnNet(
-        input_c=args.input_size, conv_c=args.conv_c,
-        conv_k=args.conv_k, conv_s=args.conv_s,
-        conv_p=args.conv_p, pool_k=args.pool_k, pool_s=args.pool_s,
-        pool_type=args.pool_type, line_h=args.linear_hidden
-    )
+    if args.mode == 'dense':
+        net = CnnNet(
+            input_c=args.input_size, conv_c=args.conv_c,
+            conv_k=args.conv_k, conv_s=args.conv_s,
+            conv_p=args.conv_p, pool_k=args.pool_k, pool_s=args.pool_s,
+            pool_type=args.pool_type, line_h=args.linear_hidden
+        )
+    elif args.mode == 'attention':
+        net = AttentionNet(
+            input_size=5000, input_c=args.input_size,
+            block_c=args.conv_c, block_k=args.conv_k, pool_k=args.pool_k,
+            pool_s=args.pool_s, pool_type=args.pool_type,
+            line_h=args.linear_hidden
+        )
     net = net.to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(
@@ -311,12 +376,13 @@ def main():
         net, criterion, dataloaders, optimizer, device, epochs=args.epoch)
 
     # 保存模型和结果
-    if not os.path.exists(args.save_dir):
-        os.mkdir(args.save_dir)
-    torch.save(state_dict, os.path.join(args.save_dir, 'model.pth'))
-    pd.DataFrame(hist).to_csv(os.path.join(args.save_dir, 'train.csv'))
-    np.savetxt(os.path.join(args.save_dir, 'test.txt'), test_result)
-    torch.save(args.__dir__, os.path.join(args.save_dir, 'config.json'))
+    save_dir = os.path.join(args.save_root, args.save)
+    if not os.path.exists(save_dir):
+        os.mkdir(save_dir)
+    torch.save(state_dict, os.path.join(save_dir, 'model.pth'))
+    pd.DataFrame(hist).to_csv(os.path.join(save_dir, 'train.csv'))
+    np.savetxt(os.path.join(save_dir, 'test.txt'), test_result)
+    torch.save(args.__dict__, os.path.join(save_dir, 'config.pth'))
 
 
 if __name__ == '__main__':
