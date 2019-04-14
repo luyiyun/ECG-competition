@@ -1,10 +1,7 @@
 import math
-from itertools import chain
 from collections import Iterable
 
-import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 def shape_calculate(i_s, k, p, s, d):

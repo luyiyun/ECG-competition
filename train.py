@@ -1,7 +1,5 @@
 import os
 import copy
-import math
-from itertools import chain
 
 import numpy as np
 import pandas as pd
@@ -9,14 +7,15 @@ import scipy.io as io
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, f1_score
 import progressbar as pb
 import argparse
+from torchvision import transforms
 
 from attention_net import AttentionNet
+from simple_net import CnnNet
 
 
 class MyDataSet(Dataset):
@@ -28,10 +27,11 @@ class MyDataSet(Dataset):
         trainval_root：所有数据文件所在的文件夹路径。
     '''
 
-    def __init__(self, txt_file, trainval_root):
+    def __init__(self, txt_file, trainval_root, transfrom=None):
         super(MyDataSet, self).__init__()
         self.txt_file = txt_file
         self.trainval_root = trainval_root
+        self.transfrom = transfrom
 
     def __len__(self):
         return len(self.txt_file)
@@ -42,101 +42,34 @@ class MyDataSet(Dataset):
         # 将路径和文件名merge在一起
         file_path = os.path.join(self.trainval_root, file_name + ".mat")
         file = io.loadmat(file_path)
-        return file["data"], np.int(label)
+        data = file['data']
+        if self.transfrom is not None:
+            data = self.transfrom(data)
+        return data, np.int(label)
 
 
-class Net(nn.Module):
+class LogTransfer:
 
-    def __init__(self, input_size):
-        super(Net, self).__init__()
-        self.rnn1 = nn.GRU(input_size, 50, 1, dropout=0.5)
-        self.rnn2 = nn.GRU(50, 1, 1, dropout=0.5)
-        self.fc = nn.Linear(5000, 2)
+    def __init__(self, zero_one=True, epsilon=10e-5):
+        self.epsilon = epsilon
+        self.zero_one = zero_one
 
-    def forward(self, x):
-        x, _ = self.rnn1(x)
-        x, _ = self.rnn2(x)
-        x = self.fc(x.permute(1, 0, 2).view(-1, 5000))
-        # x = self.fc(x[-1])
-        return x
+    def __call__(self, x):
+        if self.zero_one:
+            xmin = x.min(axis=1, keepdims=True)
+            xmax = x.max(axis=1, keepdims=True)
+            x = (x - xmin) / (xmax - xmin)
+        return np.log(x + self.epsilon)
 
 
-class CnnNet(nn.Module):
-    '''
-    Conv1d-net
-    '''
-    def __init__(
-        self, input_c, input_s=5000, conv_c=(6, 6, 6), conv_k=(100, 6, 6),
-        conv_s=(1, 1, 1), conv_p=(0, 0, 0), pool_k=20, pool_s=5,
-        pool_type='max', bn=True, line_h=[]
-    ):
-        super(CnnNet, self).__init__()
-        self.input_c = input_c
-        self.input_s = input_s
-        self.conv_c = conv_c
-        self.conv_k = conv_k
-        self.conv_s = conv_s
-        self.conv_p = conv_p
-        self.pool_k = [pool_k] * len(conv_k) \
-            if isinstance(pool_k, int) else pool_k
-        self.pool_s = [pool_s] * len(conv_s) \
-            if isinstance(pool_s, int) else pool_s
-        self.pool_p = [0] * len(conv_p)
-        self.bn = bn
-        convs = []
-        conv_c_pre = [input_c] + list(conv_c)[:-1]
-        for c_p, c_n, k, s, p in zip(
-            conv_c_pre, conv_c, conv_k, conv_s, conv_p
-        ):
-            convs.append(nn.Conv1d(c_p, c_n, k, stride=s, padding=p))
-        self.convs = nn.ModuleList(convs)
-        if pool_type == 'max':
-            self.pool = nn.MaxPool1d(pool_k, stride=pool_s)
-        elif pool_type == 'avg':
-            self.pool = nn.AvgPool1d(pool_k, stride=pool_s)
-        self.in_features = self.fc_in_shape() * conv_c[-1]
-
-        line_pre = [self.in_features] + line_h
-        line_nex = line_h + [2]
-        self.fcs = nn.ModuleList(
-            [nn.Linear(lp, ln) for lp, ln in zip(line_pre, line_nex)])
-
-        if bn:
-            bns = []
-            for c in conv_c:
-                bns.append(nn.BatchNorm1d(c))
-            self.bns = nn.ModuleList(bns)
-
-    def forward(self, x):
-        for conv, bn in zip(self.convs, self.bns):
-            x = self.pool(F.relu(bn(conv(x))))
-        for i, fc in enumerate(self.fcs):
-            if i == 0:
-                x = x.view(-1, self.in_features)
-            x = fc(x)
-            if i != (len(self.fcs)-1):
-                x = F.relu(x)
-        return x
-
-    def fc_in_shape(self):
-        all_k = list(chain(self.conv_k, self.pool_k))
-        all_s = list(chain(self.conv_s, self.pool_s))
-        all_p = list(chain(self.conv_p, self.pool_p))
-        shape = self.input_s
-        for k, s, p in zip(all_k, all_s, all_p):
-            shape = self._one_shape(shape, k, p, s)
-            if shape < 1:
-                raise ValueError('某个feature map的维度太小了')
-        return shape
-
-    @staticmethod
-    def _one_shape(i_s, k, p, s):
-        return math.floor((i_s + 2 * p - (k - 1) - 1) / s + 1)
-
-
-def test(net, criterion, dataloader, device, evaluation=True):
+def test(
+    net, dataloader, device, evaluation=True, criterion=None,
+    return_y_true=False
+):
     ''' 根据训练好的net来进行预测，可以输出loss和评价指标 '''
     print('Testing...')
+    if evaluation and criterion is None:
+        raise ValueError('if evaluation is True, criterion must be given.')
     with torch.no_grad():
         predicts = []
         y_true = []
@@ -152,27 +85,33 @@ def test(net, criterion, dataloader, device, evaluation=True):
                 running_loss += loss.item() * inputs.size(0)
                 running_corrects += torch.sum(preds == labels)
             predicts.append(outputs)
-            if evaluation:
+            if evaluation or return_y_true:
                 y_true.append(labels)
         predicts = torch.cat(predicts, 0)
         if evaluation:
             y_true = torch.cat(y_true, 0)
+            y_true = y_true.cpu().numpy()
+            positive = predicts.cpu().numpy()[:, 1]
             epoch_loss = running_loss / len(dataloader.dataset)
             epoch_acc = running_corrects.double() / len(dataloader.dataset)
-            epoch_auc = roc_auc_score(
-                y_true.cpu().numpy(), predicts.cpu().numpy()[:, 1])
-            test_results = [epoch_loss, epoch_acc.item(), epoch_auc]
-            return predicts, test_results
+            epoch_auc = roc_auc_score(y_true, positive)
+            epoch_f1 = f1_score(y_true, positive > 0.5)
+            test_results = [epoch_loss, epoch_acc.item(), epoch_auc, epoch_f1]
+            if return_y_true:
+                return predicts, y_true, test_results
+            else:
+                return predicts, test_results
+        elif return_y_true:
+            return predicts, y_true
         else:
             return predicts
 
 
 def train(
     net, criterion, dataloaders, optimizer, device, epochs=50,
-    early_stop=50
+    early_stop=50, scheduler=None
 ):
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, factor=0.7, patience=5, min_lr=1e-5, verbose=True)
+    best_loss = 100.
     best_acc = 0.
     best_auc = 0.
     best_model_wts = copy.deepcopy(net.state_dict())
@@ -225,8 +164,9 @@ def train(
                 predicts = torch.cat(predicts, 0)
                 y_true = torch.cat(y_true, 0)
                 epoch_loss = running_loss / len(dataloaders[phase].dataset)
-                epoch_acc = running_corrects.double() / len(
+                epoch_acc = (running_corrects.double() / len(
                     dataloaders[phase].dataset)
+                ).item()
                 epoch_auc = roc_auc_score(
                     y_true.cpu().numpy(), predicts.cpu().numpy()[:, 1])
                 if phase == 'train':
@@ -237,7 +177,8 @@ def train(
                     history['val_loss'].append(epoch_loss)
                     history['val_acc'].append(epoch_acc)
                     history['val_auc'].append(epoch_auc)
-                    if epoch_acc > best_acc:
+                    if epoch_loss < best_loss:
+                        best_loss = epoch_loss
                         best_acc = epoch_acc
                         best_auc = epoch_auc
                         best_model_wts = copy.deepcopy(net.state_dict())
@@ -256,7 +197,8 @@ def train(
     # 如果有test数据集，则进行他test的预测
     if 'test' in dataloaders.keys():
         _, test_results = test(
-            net, criterion, dataloaders['test'], device, evaluation=True)
+            net, dataloaders['test'], device, evaluation=True,
+            criterion=criterion)
         print(test_results)
 
     return test_results, history, best_model_wts
@@ -308,7 +250,7 @@ def main():
         '-pt', '--pool_type', default='max',
         help='pooling的种类，默认是max，还可以是avg')
     parser.add_argument(
-        '-rs', '--random_seed', default=1234, type=int, help='随机种子')
+        '-rs', '--random_seed', default=2345, type=int, help='随机种子')
     parser.add_argument(
         '-tvr', '--trainval_root', default='E:/subject-other/心电比赛/TRAIN',
         help='训练集所在的路径，默认是E:/subject-other/心电比赛/TRAIN')
@@ -331,6 +273,14 @@ def main():
     parser.add_argument(
         '-m', '--mode', default='dense',
         help='使用的网络类型，默认是dense，可以是attention')
+    parser.add_argument(
+        '-lr_s', '--lr_scheduler', default='ROP',
+        help='学习率下降的方式，ROP or Step')
+    parser.add_argument('-opt', '--optimizer',
+                        default='sgd', help='优化器，sgd or adam')
+    parser.add_argument(
+        '-lt', '--log_transfer', action='store_true',
+        help='使用此参数即代表使用log转换')
     args = parser.parse_args()
     device = torch.device("cuda:0")
 
@@ -342,10 +292,14 @@ def main():
     valid_txt, test_txt = train_test_split(
         valid_txt, test_size=0.5, shuffle=True,
         random_state=args.random_seed, stratify=valid_txt[:, 1])
+    if args.log_transfer:
+        transfer = LogTransfer()
+    else:
+        transfer = None
     datasets = {
-        "train": MyDataSet(train_txt, args.trainval_root),
-        "val": MyDataSet(valid_txt, args.trainval_root),
-        "test": MyDataSet(test_txt, args.trainval_root)
+        "train": MyDataSet(train_txt, args.trainval_root, transfrom=transfer),
+        "val": MyDataSet(valid_txt, args.trainval_root, transfrom=transfer),
+        "test": MyDataSet(test_txt, args.trainval_root, transfrom=transfer)
     }
     dataloaders = {
         k: DataLoader(v, batch_size=args.batch_size)
@@ -368,12 +322,23 @@ def main():
         )
     net = net.to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(
-        net.parameters(), lr=args.learning_rate, momentum=0.9)
+    if args.optimizer == 'sgd':
+        optimizer = optim.SGD(
+            net.parameters(), lr=args.learning_rate, momentum=0.9)
+    elif args.optimizer == 'adam':
+        optimizer = optim.Adam(
+            net.parameters(), lr=args.learning_rate)
+    if args.lr_scheduler == 'ROP':
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, factor=0.7, patience=5, min_lr=1e-5, verbose=True)
+    elif args.lr_scheduler == 'Step':
+        scheduler = optim.lr_scheduler.StepLR(
+            optimizer, step_size=7, gamma=0.9)
 
     # 训练网络
     test_result, hist, state_dict = train(
-        net, criterion, dataloaders, optimizer, device, epochs=args.epoch)
+        net, criterion, dataloaders, optimizer,
+        device, epochs=args.epoch, scheduler=scheduler)
 
     # 保存模型和结果
     save_dir = os.path.join(args.save_root, args.save)
