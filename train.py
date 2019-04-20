@@ -16,6 +16,7 @@ from torchvision import transforms
 
 from attention_net import AttentionNet
 from simple_net import CnnNet
+from transfers import DropoutBrust
 
 
 class MyDataSet(Dataset):
@@ -281,11 +282,15 @@ def main():
     parser.add_argument(
         '-lt', '--log_transfer', action='store_true',
         help='使用此参数即代表使用log转换')
+    parser.add_argument(
+        '-rf', '--reference_file', default='./reference.txt',
+        help='reference文件所在的路径，默认是./reference.txt')
     args = parser.parse_args()
     device = torch.device("cuda:0")
 
     # 导入数据
-    txt_file = np.loadtxt("./reference.txt", dtype="str")
+    txt_file = np.loadtxt(args.reference_file, dtype="str")
+    transfer = DropoutBrust()
     train_txt, valid_txt = train_test_split(
         txt_file, test_size=0.2, shuffle=True,
         random_state=args.random_seed, stratify=txt_file[:, 1])
@@ -295,7 +300,7 @@ def main():
     if args.log_transfer:
         transfer = LogTransfer()
     else:
-        transfer = None
+        transfer = DropoutBrust(p=0.1)
     datasets = {
         "train": MyDataSet(train_txt, args.trainval_root, transfrom=transfer),
         "val": MyDataSet(valid_txt, args.trainval_root, transfrom=transfer),
@@ -316,7 +321,7 @@ def main():
     elif args.mode == 'attention':
         net = AttentionNet(
             input_size=5000, input_c=args.input_size,
-            block_c=args.conv_c, block_k=args.conv_k, pool_k=args.pool_k,
+            block_c=args.conv_c, pool_k=args.pool_k,
             pool_s=args.pool_s, pool_type=args.pool_type,
             line_h=args.linear_hidden
         )
@@ -330,7 +335,7 @@ def main():
             net.parameters(), lr=args.learning_rate)
     if args.lr_scheduler == 'ROP':
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, factor=0.7, patience=5, min_lr=1e-5, verbose=True)
+            optimizer, factor=0.9, patience=5, min_lr=1e-5, verbose=True)
     elif args.lr_scheduler == 'Step':
         scheduler = optim.lr_scheduler.StepLR(
             optimizer, step_size=7, gamma=0.9)
